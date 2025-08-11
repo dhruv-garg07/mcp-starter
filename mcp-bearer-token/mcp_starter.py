@@ -1,33 +1,28 @@
-# api/mcp.py
-
-import os
-import re
-from datetime import datetime, timezone, timedelta
-from typing import Any, Optional
-import json
-import base64
 import asyncio
-
-# --- Import required libraries ---
-from fastapi import Request
+from typing import Annotated
+import os
+from dotenv import load_dotenv
 from fastmcp import FastMCP
-from mcp.server.auth.provider import AccessToken
 from fastmcp.server.auth.providers.bearer import BearerAuthProvider, RSAKeyPair
+from mcp import ErrorData, McpError
+from mcp.server.auth.provider import AccessToken
+from mcp.types import TextContent, ImageContent, INVALID_PARAMS, INTERNAL_ERROR
+from pydantic import BaseModel, Field, AnyUrl
 
-# --- Firestore Imports ---
-# These are the only external dependencies needed for the core functionality
-from google.cloud import firestore
-import google.auth.credentials
+import markdownify
+import httpx
+import readabilipy
 
-# --- Environment Variables ---
+# --- Load environment variables ---
+load_dotenv()
+
 TOKEN = os.environ.get("AUTH_TOKEN")
 MY_NUMBER = os.environ.get("MY_NUMBER")
-FIRESTORE_CREDS_B64 = os.environ.get("FIRESTORE_CREDS_B64")
 
-if not all([TOKEN, MY_NUMBER, FIRESTORE_CREDS_B64]):
-    raise RuntimeError("AUTH_TOKEN, MY_NUMBER, and FIRESTORE_CREDS_B64 must be set.")
+assert TOKEN is not None, "Please set AUTH_TOKEN in your .env file"
+assert MY_NUMBER is not None, "Please set MY_NUMBER in your .env file"
 
-# --- Auth Provider (matches starter code format) ---
+# --- Auth Provider ---
 class SimpleBearerAuthProvider(BearerAuthProvider):
     def __init__(self, token: str):
         k = RSAKeyPair.generate()
@@ -36,177 +31,185 @@ class SimpleBearerAuthProvider(BearerAuthProvider):
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         if token == self.token:
-            return AccessToken(token=token, client_id="puch-client", scopes=["*"], expires_at=None)
+            return AccessToken(
+                token=token,
+                client_id="puch-client",
+                scopes=["*"],
+                expires_at=None,
+            )
         return None
 
-# --- MCP Server Setup (matches starter code format) ---
+# --- Rich Tool Description model ---
+class RichToolDescription(BaseModel):
+    description: str
+    use_when: str
+    side_effects: str | None = None
+
+# --- Fetch Utility Class ---
+class Fetch:
+    USER_AGENT = "Puch/1.0 (Autonomous)"
+
+    @classmethod
+    async def fetch_url(
+        cls,
+        url: str,
+        user_agent: str,
+        force_raw: bool = False,
+    ) -> tuple[str, str]:
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.get(
+                    url,
+                    follow_redirects=True,
+                    headers={"User-Agent": user_agent},
+                    timeout=30,
+                )
+            except httpx.HTTPError as e:
+                raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to fetch {url}: {e!r}"))
+
+            if response.status_code >= 400:
+                raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Failed to fetch {url} - status code {response.status_code}"))
+
+            page_raw = response.text
+
+        content_type = response.headers.get("content-type", "")
+        is_page_html = "text/html" in content_type
+
+        if is_page_html and not force_raw:
+            return cls.extract_content_from_html(page_raw), ""
+
+        return (
+            page_raw,
+            f"Content type {content_type} cannot be simplified to markdown, but here is the raw content:\n",
+        )
+
+    @staticmethod
+    def extract_content_from_html(html: str) -> str:
+        """Extract and convert HTML content to Markdown format."""
+        ret = readabilipy.simple_json.simple_json_from_html_string(html, use_readability=True)
+        if not ret or not ret.get("content"):
+            return "<error>Page failed to be simplified from HTML</error>"
+        content = markdownify.markdownify(ret["content"], heading_style=markdownify.ATX)
+        return content
+
+    @staticmethod
+    async def google_search_links(query: str, num_results: int = 5) -> list[str]:
+        """
+        Perform a scoped DuckDuckGo search and return a list of job posting URLs.
+        (Using DuckDuckGo because Google blocks most programmatic scraping.)
+        """
+        ddg_url = f"https://html.duckduckgo.com/html/?q={query.replace(' ', '+')}"
+        links = []
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(ddg_url, headers={"User-Agent": Fetch.USER_AGENT})
+            if resp.status_code != 200:
+                return ["<error>Failed to perform search.</error>"]
+
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for a in soup.find_all("a", class_="result__a", href=True):
+            href = a["href"]
+            if "http" in href:
+                links.append(href)
+            if len(links) >= num_results:
+                break
+
+        return links or ["<error>No results found.</error>"]
+
+# --- MCP Server Setup ---
 mcp = FastMCP(
-    "Workout Logger",
+    "Job Finder MCP Server",
     auth=SimpleBearerAuthProvider(TOKEN),
 )
 
-# --- OPTIMIZATION: Lazy-Loaded Firestore Client ---
-db = None
-def get_db_client():
-    global db
-    if db is None:
-        try:
-            creds_json_str = base64.b64decode(FIRESTORE_CREDS_B64).decode('utf-8')
-            creds_info = json.loads(creds_json_str)
-            credentials = google.oauth2.service_account.Credentials.from_service_account_info(creds_info)
-            db = firestore.Client(credentials=credentials)
-            print("Firestore client initialized on first request.")
-        except Exception as e:
-            print(f"CRITICAL: Failed to initialize Firestore client: {e}")
-    return db
 
-# --- Helper Function to Parse Workout String ---
-def parse_workout_string(log_string: str) -> dict | None:
-    pattern = re.compile(
-        r"^(?P<name>[\w\s]+?)\s+"
-        r"(?P<weight>[\d\.]+)"
-        r"(?:\s*x\s*(?P<per_side>2))?"
-        r"\s*x\s*(?P<sets>[\d]+)"
-        r"\s*x\s*(?P<reps>[\d]+)$",
-        re.IGNORECASE
-    )
-    match = pattern.match(log_string.strip())
-    if not match:
-        simple_pattern = re.compile(
-            r"^(?P<name>[\w\s]+?)\s+"
-            r"(?P<weight>[\d\.]+)"
-            r"\s*x\s*(?P<reps>[\d]+)$",
-            re.IGNORECASE
-        )
-        match = simple_pattern.match(log_string.strip())
-        if not match:
-            return None
-    data = match.groupdict()
-    return {
-        "name": data["name"].strip().title(),
-        "weight": float(data["weight"]),
-        "sets": int(data.get("sets") or 1),
-        "reps": int(data["reps"]),
-        "per_side": data.get("per_side") is not None
-    }
+@mcp.tool
+async def about() -> dict:
+    return {"name": mcp.name, "description": "An Example Bearer token mcp server"}
 
 
-# --- Tool: validate ---
-@mcp.tool(description="Validates the server connection.")
+# --- Tool: validate (required by Puch) ---
+@mcp.tool
 async def validate() -> str:
     return MY_NUMBER
 
+# --- Tool: job_finder (now smart!) ---
+JobFinderDescription = RichToolDescription(
+    description="Smart job tool: analyze descriptions, fetch URLs, or search jobs based on free text.",
+    use_when="Use this to evaluate job descriptions or search for jobs using freeform goals.",
+    side_effects="Returns insights, fetched job descriptions, or relevant job links.",
+)
 
-# --- Tool: greet ---
-@mcp.tool(description=json.dumps({
-    "description": "Greets the user and lists available commands.",
-    "use_when": "When the user sends a greeting like 'hi', 'hello', or asks for 'help'."
-}))
-async def greet(request: Request):
-    body = await request.json()
-    user_name = body.get("message", {}).get("user", {}).get("name", "there")
-    
-    welcome_message = (
-        f"Hi {user_name}! I'm your personal workout logger.\n\n"
-        "Here's what you can do:\n\n"
-        "1️⃣ **Log a workout:**\n"
-        "   - `log Bench Press 60x5x5`\n"
-        "   - `add Squat 100x3x8`\n\n"
-        "2️⃣ **View your progress:**\n"
-        "   - `show my progress for Bench Press`\n"
-        "   - `view history for Squat`"
-    )
-    return [{"type": "text", "text": welcome_message}]
-
-
-# --- Tool: log_workout ---
-@mcp.tool(description=json.dumps({
-    "description": "Logs a workout entry into the user's personal database.",
-    "use_when": "When the user says 'log', 'add', or 'save' a workout. Example format: 'Squat 100x5x5' or 'Incline Curl 12.5x2x8'."
-}))
-async def log_workout(request: Request, entry: str):
-    db_client = get_db_client()
-    if not db_client:
-        return [{"type": "text", "text": "Error: Database is not configured correctly."}]
-
-    parsed_data = parse_workout_string(entry)
-    if not parsed_data:
-        return [{"type": "text", "text": f"Sorry, I couldn't understand that format. Try something like 'Bench Press 60x5x5'."}]
-
-    body = await request.json()
-    user_id = body.get("message", {}).get("user", {}).get("id")
-    if not user_id:
-        return [{"type": "text", "text": "Error: Could not identify user."}]
-
-    parsed_data["user_id"] = user_id
-    parsed_data["timestamp"] = datetime.now(timezone.utc)
-
-    try:
-        db_client.collection("workouts").add(parsed_data)
-        log_msg = (
-            f"💪 Logged: {parsed_data['name']}!\n"
-            f"- Weight: {parsed_data['weight']} kg"
-            f"{' (per side)' if parsed_data['per_side'] else ''}\n"
-            f"- Sets: {parsed_data['sets']}\n"
-            f"- Reps: {parsed_data['reps']}"
+@mcp.tool(description=JobFinderDescription.model_dump_json())
+async def job_finder(
+    user_goal: Annotated[str, Field(description="The user's goal (can be a description, intent, or freeform query)")],
+    job_description: Annotated[str | None, Field(description="Full job description text, if available.")] = None,
+    job_url: Annotated[AnyUrl | None, Field(description="A URL to fetch a job description from.")] = None,
+    raw: Annotated[bool, Field(description="Return raw HTML content if True")] = False,
+) -> str:
+    """
+    Handles multiple job discovery methods: direct description, URL fetch, or freeform search query.
+    """
+    if job_description:
+        return (
+            f"📝 **Job Description Analysis**\n\n"
+            f"---\n{job_description.strip()}\n---\n\n"
+            f"User Goal: **{user_goal}**\n\n"
+            f"💡 Suggestions:\n- Tailor your resume.\n- Evaluate skill match.\n- Consider applying if relevant."
         )
-        return [{"type": "text", "text": log_msg}]
-    except Exception as e:
-        return [{"type": "text", "text": f"Sorry, there was an error saving your workout: {e}"}]
+
+    if job_url:
+        content, _ = await Fetch.fetch_url(str(job_url), Fetch.USER_AGENT, force_raw=raw)
+        return (
+            f"🔗 **Fetched Job Posting from URL**: {job_url}\n\n"
+            f"---\n{content.strip()}\n---\n\n"
+            f"User Goal: **{user_goal}**"
+        )
+
+    if "look for" in user_goal.lower() or "find" in user_goal.lower():
+        links = await Fetch.google_search_links(user_goal)
+        return (
+            f"🔍 **Search Results for**: _{user_goal}_\n\n" +
+            "\n".join(f"- {link}" for link in links)
+        )
+
+    raise McpError(ErrorData(code=INVALID_PARAMS, message="Please provide either a job description, a job URL, or a search query in user_goal."))
 
 
-# --- Tool: view_progress (Simplified: No Graph) ---
-@mcp.tool(description=json.dumps({
-    "description": "Shows a user's personal, saved workout history for a specific exercise from the database.",
-    "use_when": "When the user asks to 'see', 'view', 'show', or 'check' their logs, history, or progress for an exercise."
-}))
-async def view_progress(request: Request, exercise: str):
-    db_client = get_db_client()
-    if not db_client:
-        return [{"type": "text", "text": "Error: Database is not configured correctly."}]
+# Image inputs and sending images
 
-    body = await request.json()
-    user_id = body.get("message", {}).get("user", {}).get("id")
-    if not user_id:
-        return [{"type": "text", "text": "Error: Could not identify user."}]
+MAKE_IMG_BLACK_AND_WHITE_DESCRIPTION = RichToolDescription(
+    description="Convert an image to black and white and save it.",
+    use_when="Use this tool when the user provides an image URL and requests it to be converted to black and white.",
+    side_effects="The image will be processed and saved in a black and white format.",
+)
 
-    exercise_name = exercise.strip().title()
+@mcp.tool(description=MAKE_IMG_BLACK_AND_WHITE_DESCRIPTION.model_dump_json())
+async def make_img_black_and_white(
+    puch_image_data: Annotated[str, Field(description="Base64-encoded image data to convert to black and white")] = None,
+) -> list[TextContent | ImageContent]:
+    import base64
+    import io
+
+    from PIL import Image
 
     try:
-        # Query Firestore for the last 5 entries for this user and exercise
-        docs = db_client.collection("workouts") \
-            .where("user_id", "==", user_id) \
-            .where("name", "==", exercise_name) \
-            .order_by("timestamp", direction=firestore.Query.DESCENDING) \
-            .limit(5) \
-            .stream()
-        
-        logs = list(docs)
-        if not logs:
-            return [{"type": "text", "text": f"No logs found for '{exercise_name}'. Try logging one first!"}]
+        image_bytes = base64.b64decode(puch_image_data)
+        image = Image.open(io.BytesIO(image_bytes))
 
-        summary_text = f"📈 Last 5 logs for {exercise_name}:\n\n"
-        ist = timezone(timedelta(hours=5, minutes=30))
+        bw_image = image.convert("L")
 
-        for log in logs:
-            data = log.to_dict()
-            timestamp_ist = data['timestamp'].astimezone(ist)
-            date_str = timestamp_ist.strftime("%b %d, %Y")
-            log_str = (f"- *{date_str}*: {data['weight']}kg x {data['sets']}s x {data['reps']}r")
-            summary_text += log_str + "\n"
-        
-        return [{"type": "text", "text": summary_text}]
+        buf = io.BytesIO()
+        bw_image.save(buf, format="PNG")
+        bw_bytes = buf.getvalue()
+        bw_base64 = base64.b64encode(bw_bytes).decode("utf-8")
 
+        return [ImageContent(type="image", mimeType="image/png", data=bw_base64)]
     except Exception as e:
-        return [{"type": "text", "text": f"Sorry, there was an error fetching your progress: {e}"}]
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=str(e)))
 
-
-# --- CRITICAL FIX FOR HOSTING (Vercel, Render, etc.) ---
-# This line exposes the underlying FastAPI application that FastMCP builds.
-# Hosting services look for a variable named 'app' to run.
-app = mcp.app
-
-# --- Run MCP Server Locally ---
+# --- Run MCP Server ---
 async def main():
     print("🚀 Starting MCP server on http://0.0.0.0:8086")
     await mcp.run_async("streamable-http", host="0.0.0.0", port=8086)
