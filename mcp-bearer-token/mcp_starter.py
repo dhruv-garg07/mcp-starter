@@ -108,7 +108,7 @@ greet_desc = RichToolDescription(
     use_when="When the user sends a greeting like 'hi', 'hello', or asks for 'help'."
 )
 @mcp.tool(description=greet_desc.model_dump_json())
-async def greet(request: Request):
+async def greet(request): # CORRECTED: Removed ': Request' type hint
     body = await request.json()
     user_name = body.get("message", {}).get("user", {}).get("name", "there")
     
@@ -131,7 +131,7 @@ log_workout_desc = RichToolDescription(
     use_when="When the user says 'log', 'add', or 'save' a workout. Example format: 'Squat 100x5x5' or 'Incline Curl 12.5x2x8'."
 )
 @mcp.tool(description=log_workout_desc.model_dump_json())
-async def log_workout(request: Request, entry: str):
+async def log_workout(request, entry: str): # CORRECTED: Removed ': Request' type hint
     db_client = get_db_client()
     if not db_client:
         return [{"type": "text", "text": "Error: Database is not configured correctly."}]
@@ -168,7 +168,7 @@ view_progress_desc = RichToolDescription(
     use_when="When the user asks to 'see', 'view', 'show', or 'check' their logs, history, or progress for an exercise."
 )
 @mcp.tool(description=view_progress_desc.model_dump_json())
-async def view_progress(request: Request, exercise: str):
+async def view_progress(request, exercise: str): # CORRECTED: Removed ': Request' type hint
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
