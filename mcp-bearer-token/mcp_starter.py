@@ -6,16 +6,17 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 # --- Import required libraries ---
-from fastapi import Request
-from fastmcp import FastMCP
-from mcp.server.auth.provider import AccessToken
-from fastmcp.server.auth.providers.bearer import BearerAuthProvider, RSAKeyPair
+from fastapi import FastAPI, Request, HTTPException
 
 # --- Firestore Imports ---
 from google.cloud import firestore
 import google.auth.credentials
 import json
 import base64
+
+# --- FastAPI App ---
+# We use the standard FastAPI app, which is fully compatible with Vercel/Render.
+app = FastAPI()
 
 # --- Environment Variables ---
 TOKEN = os.environ.get("AUTH_TOKEN")
@@ -25,24 +26,7 @@ FIRESTORE_CREDS_B64 = os.environ.get("FIRESTORE_CREDS_B64")
 if not all([TOKEN, MY_NUMBER, FIRESTORE_CREDS_B64]):
     raise RuntimeError("AUTH_TOKEN, MY_NUMBER, and FIRESTORE_CREDS_B64 must be set.")
 
-# --- Auth Provider (for FastMCP) ---
-class SimpleBearerAuthProvider(BearerAuthProvider):
-    def __init__(self, token: str):
-        k = RSAKeyPair.generate()
-        super().__init__(public_key=k.public_key, jwks_uri=None, issuer=None, audience=None)
-        self.token = token
-
-    async def load_access_token(self, token: str) -> AccessToken | None:
-        if token == self.token:
-            return AccessToken(token=token, client_id="puch-client", scopes=["*"], expires_at=None)
-        return None
-
-# --- MCP Server Setup ---
-# We use FastMCP to build our server and its manifest automatically.
-mcp = FastMCP(
-    "Workout Logger",
-    auth=SimpleBearerAuthProvider(TOKEN),
-)
+SERVER_ID = f"mcp.puch.ai:server:{MY_NUMBER}"
 
 # --- OPTIMIZATION: Lazy-Loaded Firestore Client ---
 db = None
@@ -89,22 +73,57 @@ def parse_workout_string(log_string: str) -> dict | None:
         "per_side": data.get("per_side") is not None
     }
 
+# --- MANIFEST ENDPOINT ---
+@app.api_route("/", methods=["GET", "POST"])
+async def get_manifest() -> dict[str, Any]:
+    return {
+        "mcp_version": "1.0",
+        "server_id": SERVER_ID,
+        "name": "Workout Logger",
+        "author": "You!",
+        "description": "A server to log workouts and track progress over time with graphs.",
+        "auth": {"auth_type": "http_bearer"},
+        "tools": {
+            "validate": {
+                "description": "Validates the server connection.",
+                "parameters": [],
+                "returns": [{"type": "string"}]
+            },
+            "greet": {
+                "description": "Greets the user and lists available commands. Use this when the user sends a greeting like 'hi', 'hello', or asks for 'help'.",
+                "parameters": [],
+                "returns": [{"type": "text"}]
+            },
+            "log_workout": {
+                "description": "Logs a workout entry into the user's personal database. Use this when the user says 'log', 'add', or 'save' a workout. Example format: 'Squat 100x5x5' or 'Incline Curl 12.5x2x8'.",
+                "parameters": [
+                    {"name": "entry", "type": "string", "description": "The workout string to log.", "required": True}
+                ],
+                "returns": [{"type": "text"}]
+            },
+            "view_progress": {
+                "description": "Shows a user's personal, saved workout history and a progress graph for a specific exercise from the database. Use this when the user asks to 'see', 'view', 'show', or 'check' their logs, history, or progress for an exercise.",
+                "parameters": [
+                    {"name": "exercise", "type": "string", "description": "The name of the exercise to view progress for.", "required": True}
+                ],
+                "returns": [{"type": "text"}, {"type": "image"}]
+            }
+        }
+    }
 
 # --- Tool: validate ---
-@mcp.tool(description="Validates the server connection.")
-async def validate() -> str:
+@app.api_route("/run/validate", methods=["GET", "POST"])
+async def run_validate(request: Request):
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or auth_header != f"Bearer {TOKEN}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
     return MY_NUMBER
 
-
 # --- Tool: greet ---
-@mcp.tool(description=json.dumps({
-    "description": "Greets the user and lists available commands.",
-    "use_when": "When the user sends a greeting like 'hi', 'hello', or asks for 'help'."
-}))
-async def greet(request):
+@app.post("/run/greet")
+async def run_greet(request: Request):
     body = await request.json()
     user_name = body.get("message", {}).get("user", {}).get("name", "there")
-    
     welcome_message = (
         f"Hi {user_name}! I'm your personal workout logger.\n\n"
         "Here's what you can do:\n\n"
@@ -117,26 +136,23 @@ async def greet(request):
     )
     return [{"type": "text", "text": welcome_message}]
 
-
 # --- Tool: log_workout ---
-@mcp.tool(description=json.dumps({
-    "description": "Logs a workout entry into the user's personal database.",
-    "use_when": "When the user says 'log', 'add', or 'save' a workout. Example format: 'Squat 100x5x5' or 'Incline Curl 12.5x2x8'."
-}))
-async def log_workout(request, entry: str):
+@app.post("/run/log_workout")
+async def run_log_workout(request: Request):
     db_client = get_db_client()
     if not db_client:
         return [{"type": "text", "text": "Error: Database is not configured correctly."}]
+
+    body = await request.json()
+    entry = body.get("parameters", {}).get("entry")
+    if not entry:
+        return [{"type": "text", "text": "Sorry, I didn't get a workout to log."}]
 
     parsed_data = parse_workout_string(entry)
     if not parsed_data:
         return [{"type": "text", "text": f"Sorry, I couldn't understand that format. Try something like 'Bench Press 60x5x5'."}]
 
-    body = await request.json()
     user_id = body.get("message", {}).get("user", {}).get("id")
-    if not user_id:
-        return [{"type": "text", "text": "Error: Could not identify user."}]
-
     parsed_data["user_id"] = user_id
     parsed_data["timestamp"] = datetime.now(timezone.utc)
 
@@ -153,13 +169,9 @@ async def log_workout(request, entry: str):
     except Exception as e:
         return [{"type": "text", "text": f"Sorry, there was an error saving your workout: {e}"}]
 
-
 # --- Tool: view_progress ---
-@mcp.tool(description=json.dumps({
-    "description": "Shows a user's personal, saved workout history and a progress graph for a specific exercise from the database.",
-    "use_when": "When the user asks to 'see', 'view', 'show', or 'check' their logs, history, or progress for an exercise."
-}))
-async def view_progress(request, exercise: str):
+@app.post("/run/view_progress")
+async def run_view_progress(request: Request):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -171,8 +183,9 @@ async def view_progress(request, exercise: str):
 
     body = await request.json()
     user_id = body.get("message", {}).get("user", {}).get("id")
-    if not user_id:
-        return [{"type": "text", "text": "Error: Could not identify user."}]
+    exercise = body.get("parameters", {}).get("exercise")
+    if not exercise:
+        return [{"type": "text", "text": "Sorry, I didn't get an exercise name to look up."}]
 
     exercise_name = exercise.strip().title()
 
@@ -223,8 +236,3 @@ async def view_progress(request, exercise: str):
         ]
     except Exception as e:
         return [{"type": "text", "text": f"Sorry, there was an error fetching your progress: {e}"}]
-
-
-# --- CRITICAL FIX FOR VERCEL ---
-# Expose the underlying FastAPI app for Vercel to run.
-app = mcp.app
