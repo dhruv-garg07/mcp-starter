@@ -1,0 +1,6 @@
+fastmcp
+fastapi
+pydantic
+google-cloud-firestore
+google-auth
+matplotlib
