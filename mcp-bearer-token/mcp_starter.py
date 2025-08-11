@@ -7,7 +7,6 @@ from typing import Any, Optional
 
 # --- Import required libraries ---
 from fastapi import Request
-from pydantic import BaseModel
 from fastmcp import FastMCP
 from mcp.server.auth.provider import AccessToken
 from fastmcp.server.auth.providers.bearer import BearerAuthProvider, RSAKeyPair
@@ -37,11 +36,6 @@ class SimpleBearerAuthProvider(BearerAuthProvider):
         if token == self.token:
             return AccessToken(token=token, client_id="puch-client", scopes=["*"], expires_at=None)
         return None
-
-# --- Rich Tool Description Model ---
-class RichToolDescription(BaseModel):
-    description: str
-    use_when: str
 
 # --- MCP Server Setup ---
 # We use FastMCP to build our server and its manifest automatically.
@@ -103,12 +97,11 @@ async def validate() -> str:
 
 
 # --- Tool: greet ---
-greet_desc = RichToolDescription(
-    description="Greets the user and lists available commands.",
-    use_when="When the user sends a greeting like 'hi', 'hello', or asks for 'help'."
-)
-@mcp.tool(description=greet_desc.model_dump_json())
-async def greet(request): # CORRECTED: Removed ': Request' type hint
+@mcp.tool(description=json.dumps({
+    "description": "Greets the user and lists available commands.",
+    "use_when": "When the user sends a greeting like 'hi', 'hello', or asks for 'help'."
+}))
+async def greet(request):
     body = await request.json()
     user_name = body.get("message", {}).get("user", {}).get("name", "there")
     
@@ -126,12 +119,11 @@ async def greet(request): # CORRECTED: Removed ': Request' type hint
 
 
 # --- Tool: log_workout ---
-log_workout_desc = RichToolDescription(
-    description="Logs a workout entry into the user's personal database.",
-    use_when="When the user says 'log', 'add', or 'save' a workout. Example format: 'Squat 100x5x5' or 'Incline Curl 12.5x2x8'."
-)
-@mcp.tool(description=log_workout_desc.model_dump_json())
-async def log_workout(request, entry: str): # CORRECTED: Removed ': Request' type hint
+@mcp.tool(description=json.dumps({
+    "description": "Logs a workout entry into the user's personal database.",
+    "use_when": "When the user says 'log', 'add', or 'save' a workout. Example format: 'Squat 100x5x5' or 'Incline Curl 12.5x2x8'."
+}))
+async def log_workout(request, entry: str):
     db_client = get_db_client()
     if not db_client:
         return [{"type": "text", "text": "Error: Database is not configured correctly."}]
@@ -163,12 +155,11 @@ async def log_workout(request, entry: str): # CORRECTED: Removed ': Request' typ
 
 
 # --- Tool: view_progress ---
-view_progress_desc = RichToolDescription(
-    description="Shows a user's personal, saved workout history and a progress graph for a specific exercise from the database.",
-    use_when="When the user asks to 'see', 'view', 'show', or 'check' their logs, history, or progress for an exercise."
-)
-@mcp.tool(description=view_progress_desc.model_dump_json())
-async def view_progress(request, exercise: str): # CORRECTED: Removed ': Request' type hint
+@mcp.tool(description=json.dumps({
+    "description": "Shows a user's personal, saved workout history and a progress graph for a specific exercise from the database.",
+    "use_when": "When the user asks to 'see', 'view', 'show', or 'check' their logs, history, or progress for an exercise."
+}))
+async def view_progress(request, exercise: str):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt

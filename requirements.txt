@@ -1,6 +1,5 @@
 fastapi
 fastmcp
-pydantic
 google-cloud-firestore
 google-auth
 matplotlib
